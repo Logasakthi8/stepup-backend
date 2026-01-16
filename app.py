@@ -306,7 +306,13 @@ def create_post():
             "comments": []
         }
 
-        return jsonify({'post': hydrated_post}), 201
+        return jsonify({
+            "post": hydrated_post,
+            "points_earned": points,
+            "total_points": user.get("total_points", 0) + points,
+            "current_day": current_day + 1
+        }), 201
+
 
     except Exception as e:
         app.logger.error(f"Create post error: {str(e)}", exc_info=True)
@@ -538,8 +544,10 @@ def get_users():
                 "profile_photo": user.get("profile_photo"),
                 "followers": [str(i) for i in user.get("followers", [])],
                 "following": [str(i) for i in user.get("following", [])],
-                "active_challenge": active_challenge
+                "total_points": user.get("total_points", 0),  # 🔥 ADD THIS
+                "active_challenge": active_challenge    
             })
+
 
         return jsonify({"users": users}), 200
 
