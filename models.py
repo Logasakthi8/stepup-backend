@@ -672,20 +672,18 @@ class Challenge:
         return debug_info
     
     def update_challenge_day(self, challenge_id: str, day_number: int, 
-                       post_id: str, points: int = 100) -> bool:
+                         post_id: str, points: int = 100) -> bool:
         oid = safe_objectid(challenge_id)
         if not oid:
             return False
-        
-        # Find the challenge first
+
         challenge = self.collection.find_one({"_id": oid})
         if not challenge:
             return False
-        
+        user_oid = challenge.get("user_id")
+
         calendar_days = challenge.get("calendar_days", [])
         found_day = False
-        
-        # Find and update the specific day
         for i, day in enumerate(calendar_days):
             if day.get("day_number") == day_number:
                 calendar_days[i]["status"] = "completed"
@@ -694,30 +692,29 @@ class Challenge:
                 calendar_days[i]["completed_at"] = datetime.utcnow()
                 found_day = True
                 break
-        
+
         if not found_day:
             return False
-        
-        update_data = {
-            "$set": {
-                "calendar_days": calendar_days,
-                "updated_at": datetime.utcnow()
-            },
-            "$inc": {"total_points": points}
-        }
-        
-        # Only increment current_day if it's the current day
-        if challenge.get("current_day") == day_number:
-            new_current_day = min(day_number + 1, challenge.get("duration", day_number + 1))
-            update_data["$set"]["current_day"] = new_current_day
-        
-        # Update challenge
-        result = self.collection.update_one(
+
+    # ✅ UPDATE BOTH CHALLENGE + USER
+        self.collection.update_one(
             {"_id": oid},
-            update_data
+            {
+                "$set": {
+                    "calendar_days": calendar_days,
+                    "updated_at": datetime.utcnow(),
+                    "current_day": min(day_number + 1, challenge.get("duration", day_number + 1))
+                },
+                "$inc": {"total_points": points}
+            }
         )
-        
-        return result.modified_count > 0
+    # 🔥 THIS WAS MISSING
+        self.db.users.update_one(
+            {"_id": user_oid},
+            {"$inc": {"total_points": points}}
+        )
+
+        return True
     
     def get_challenge_calendar(self, challenge_id: str) -> Optional[List[Dict[str, Any]]]:
         """
