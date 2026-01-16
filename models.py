@@ -798,6 +798,7 @@ class Challenge:
 class Post:
     def __init__(self, db):
         self.collection = db.posts
+        self.collection = db.posts
 
     def create_post(self, user_id, challenge_id, day_number, description='', image_url=None, image_type=None):
         user_oid = safe_objectid(user_id)
