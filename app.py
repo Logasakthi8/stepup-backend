@@ -274,11 +274,7 @@ def create_post():
             return jsonify({'error': 'Failed to update challenge progress'}), 500
 
         # 6️⃣ Update user points
-        db.users.update_one(
-            {'_id': ObjectId(user_id)},
-            {'$inc': {'total_points': points}}
-        )
-
+        
         # ================================
         # 🔥 HYDRATE POST (FEED FORMAT)
         # ================================
@@ -309,7 +305,7 @@ def create_post():
         return jsonify({
             "post": hydrated_post,
             "points_earned": points,
-            "total_points": user.get("total_points", 0) + points,
+            "total_points": user.get("total_points", 0),
             "current_day": current_day + 1
         }), 201
 
