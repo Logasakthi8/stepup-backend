@@ -797,7 +797,7 @@ class Challenge:
 
 class Post:
     def __init__(self, db):
-        self.collection = db.posts
+        self.db = db              # 🔥 ADD THIS
         self.collection = db.posts
 
     def create_post(self, user_id, challenge_id, day_number, description='', image_url=None, image_type=None):
@@ -994,4 +994,5 @@ class Follow:
         )
         
         return True
+
 
