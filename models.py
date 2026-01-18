@@ -417,7 +417,8 @@ class Challenge:
             # 1. It's a past date IN IST
             # 2. The day is still pending
             # 3. We're past the posting window for that day in IST
-            if day_date < today_ist and day.get("status") == "pending":
+            if (day_date < today_ist and day.get("status") == "pending"):
+
                 # Check if window has passed for this specific day in IST
                 window_start_str, window_end_str = self._get_window_times_from_day(day)
                 
@@ -425,7 +426,11 @@ class Challenge:
                     try:
                         # Parse the window end time
                         window_end = datetime.fromisoformat(window_end_str)
+                        if window_end.tzinfo is None:
+                            window_end = self.ist_tz.localize(window_end)
+
                         current_ist = self._get_user_now()
+
                         
                         # If the stored time is UTC (old format), convert to IST
                         if "Z" in window_end_str or "+00:00" in window_end_str:
@@ -508,8 +513,11 @@ class Challenge:
         
         try:
             # Parse window times
-            window_start = datetime.fromisoformat(window_start_str)
-            window_end = datetime.fromisoformat(window_end_str)
+            if window_start.tzinfo is None:
+                window_start = self.ist_tz.localize(window_start)
+            if window_end.tzinfo is None:
+                window_end = self.ist_tz.localize(window_end)
+
             
             # If the stored time is in UTC (old format), convert to IST
             if "Z" in window_start_str or "+00:00" in window_start_str:
@@ -994,5 +1002,6 @@ class Follow:
         )
         
         return True
+
 
 
