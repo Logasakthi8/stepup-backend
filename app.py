@@ -263,15 +263,7 @@ def create_post():
         )
 
         # 5️⃣ Update challenge progress
-        success = challenge_model.update_challenge_day(
-            str(challenge['_id']),
-            current_day,
-            str(post['_id']),
-            points
-        )
-
-        if not success:
-            return jsonify({'error': 'Failed to update challenge progress'}), 500
+        
 
         # 6️⃣ Update user points
         
@@ -748,3 +740,4 @@ def unfollow_user(user_id):
 
 if __name__ == "__main__":
     app.run(debug=True)
+
