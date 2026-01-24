@@ -54,12 +54,19 @@ def convert_object_ids(obj):
     elif isinstance(obj, dict):
         result = {}
         for key, value in obj.items():
-            if isinstance(value, ObjectId):
+            if key == '_id' and isinstance(value, ObjectId):
+                result[key] = str(value)
+            elif isinstance(value, ObjectId):
+                # Keep ObjectId as string for all fields
                 result[key] = str(value)
             elif isinstance(value, datetime):
                 result[key] = value.isoformat()
             elif isinstance(value, bytes):
-                result[key] = value.decode('utf-8', errors='ignore')
+                # Handle bytes specifically for images
+                try:
+                    result[key] = value.decode('utf-8', errors='ignore')
+                except:
+                    result[key] = str(value)
             elif isinstance(value, (dict, list)):
                 result[key] = convert_object_ids(value)
             else:
@@ -70,9 +77,11 @@ def convert_object_ids(obj):
     elif isinstance(obj, datetime):
         return obj.isoformat()
     elif isinstance(obj, bytes):
-        return obj.decode('utf-8', errors='ignore')
+        try:
+            return obj.decode('utf-8', errors='ignore')
+        except:
+            return str(obj)
     return obj
-
 # ---------------- AUTH ----------------
 
 @app.route('/api/auth/signup', methods=['POST'])
@@ -375,7 +384,6 @@ def add_comment(post_id):
     except Exception as e:
         app.logger.error(f"Comment error: {str(e)}", exc_info=True)
         return jsonify({'error': f'Server error: {str(e)}'}), 500
-
 @app.route('/api/feed', methods=['GET'])
 @jwt_required()
 def get_feed():
@@ -406,6 +414,7 @@ def get_feed():
 
         for post in posts_cursor:
             try:
+                # Convert ObjectId first
                 post_dict = convert_object_ids(post)
 
                 post_user_id = post_dict.get('user_id')
@@ -422,48 +431,52 @@ def get_feed():
                     challenge = challenge_model.collection.find_one(
                         {'_id': ObjectId(post_dict['challenge_id'])}
                     )
-                    if challenge:
-                        challenge = convert_object_ids(challenge)
-
-                if not challenge:
-                    continue
-
+                
                 # ✅ FIX: Proper image data handling
                 image_data = None
-                if post.get('image_url'):
-                    # Check if it's already a base64 string or needs processing
-                    if isinstance(post['image_url'], str):
-                        # If it's already a base64 string
-                        if post['image_url'].startswith('data:'):
-                            image_data = post['image_url']
+                if post_dict.get('image_url'):
+                    # Check if it's a base64 string
+                    image_url = post_dict.get('image_url')
+                    if isinstance(image_url, str):
+                        if image_url.startswith('data:'):
+                            image_data = image_url
                         else:
-                            # If it's stored as base64 without data URI prefix
-                            mime_type = post.get('image_type', 'image/jpeg')
-                            image_data = f"data:{mime_type};base64,{post['image_url']}"
-                    elif isinstance(post['image_url'], bytes):
-                        # If it's stored as bytes
-                        mime_type = post.get('image_type', 'image/jpeg')
-                        image_data = f"data:{mime_type};base64,{base64.b64encode(post['image_url']).decode('utf-8')}"
+                            # It's a base64 string without data URI
+                            mime_type = post_dict.get('image_type', 'image/jpeg')
+                            image_data = f"data:{mime_type};base64,{image_url}"
                 
-                # Get description (handle both old and new field names)
+                # Get description
                 description = post_dict.get('description') or post_dict.get('content') or ''
-
+                
                 # Boost state
                 boosts = post_dict.get('boosts', [])
-                is_boosted_by_user = user_id in [str(b) for b in boosts]
+                is_boosted_by_user = str(user_id) in boosts
+
+                # ✅ FIX: Add challenge details even if None
+                challenge_name = None
+                if challenge:
+                    challenge = convert_object_ids(challenge)
+                    challenge_name = challenge.get("challenge_name")
 
                 enriched.append({
-                    **post_dict,
-                    "image_url": image_data,  # ✅ This should now work
-                    "description": description,  # ✅ Add description to response
+                    "_id": post_dict.get("_id"),
+                    "user_id": post_dict.get("user_id"),
+                    "challenge_id": post_dict.get("challenge_id"),
+                    "day_number": post_dict.get("day_number"),
+                    "description": description,
+                    "image_url": image_data,
+                    "image_type": post_dict.get("image_type"),
                     "user_name": user.get("name", "Unknown User"),
                     "profile_photo": user.get("profile_photo"),
-                    "challenge_name": challenge.get("challenge_name"),
-                    "total_points": challenge.get("total_points", 0),
+                    "challenge_name": challenge_name,
+                    "points_earned": post_dict.get("points_earned", 0),
+                    "total_points": post_dict.get("total_points", 0),
                     "is_boosted_by_user": is_boosted_by_user,
-                    "boosts_count": post_dict.get("boosts_count", 0),
-                    "comment_count": post_dict.get("comment_count", 0),
-                    "comments": post_dict.get("comments", [])
+                    "boosts": boosts,
+                    "boosts_count": len(boosts),
+                    "comment_count": len(post_dict.get("comments", [])),
+                    "comments": post_dict.get("comments", []),
+                    "created_at": post_dict.get("created_at")
                 })
 
             except Exception as e:
@@ -486,7 +499,6 @@ def get_feed():
             "error": "Failed to load feed"
         }), 500
         
-        
 @app.route('/api/post/<post_id>', methods=['DELETE'])
 @jwt_required()
 def delete_post(post_id):
@@ -506,6 +518,7 @@ def get_users():
     try:
         current_user_id = get_jwt_identity()
 
+        # Find all users except current user
         users_cursor = db.users.find(
             {"_id": {"$ne": ObjectId(current_user_id)}},
             {"password": 0}
@@ -514,35 +527,48 @@ def get_users():
         users = []
 
         for user in users_cursor:
+            # Get active challenge details
             active_challenge = None
             if user.get("current_challenge"):
-                challenge = db.challenges.find_one({"_id": ObjectId(user["current_challenge"])})
+                challenge = db.challenges.find_one(
+                    {"_id": ObjectId(user["current_challenge"]), "status": "active"}
+                )
                 if challenge:
                     active_challenge = {
-                        "challenge_name": challenge.get("challenge_name"),
-                        "current_day": challenge.get("current_day"),
-                        "duration": challenge.get("duration"),
-                        "total_points": challenge.get("total_points", 0)
+                        "_id": str(challenge["_id"]),
+                        "challenge_name": challenge.get("challenge_name", ""),
+                        "current_day": challenge.get("current_day", 0),
+                        "duration": challenge.get("duration", 30),
+                        "total_points": challenge.get("total_points", 0),
+                        "status": challenge.get("status", "active")
                     }
-
-            users.append({
+            
+            # Convert followers/following to string lists
+            followers = [str(follower_id) for follower_id in user.get("followers", [])]
+            following = [str(following_id) for following_id in user.get("following", [])]
+            
+            # Create user object
+            user_obj = {
                 "_id": str(user["_id"]),
-                "name": user.get("name"),
-                "email": user.get("email"),
+                "name": user.get("name", ""),
+                "email": user.get("email", ""),
+                "bio": user.get("bio", ""),
                 "profile_photo": user.get("profile_photo"),
-                "followers": [str(i) for i in user.get("followers", [])],
-                "following": [str(i) for i in user.get("following", [])],
-                "total_points": user.get("total_points", 0),  # 🔥 ADD THIS
-                "active_challenge": active_challenge    
-            })
-
+                "followers": followers,
+                "following": following,
+                "total_points": user.get("total_points", 0),
+                "active_challenge": active_challenge,
+                "isVerified": user.get("isVerified", False)
+            }
+            
+            users.append(user_obj)
 
         return jsonify({"users": users}), 200
 
     except Exception as e:
         app.logger.error(f"Get users error: {str(e)}", exc_info=True)
-        return jsonify({"error": "Failed to fetch users"}), 500
-
+        return jsonify({"error": "Failed to fetch users", "details": str(e)}), 500
+        
 # ---------------- MY PROFILE ----------------
 
 @app.route('/api/user/profile', methods=['GET'])
@@ -555,38 +581,55 @@ def my_profile():
         if not user:
             return jsonify({'error': 'User not found'}), 404
 
+        # Hide password
         user['password'] = None
 
+        # Create profile image data URI
         profile_image = None
         if user.get('profile_photo'):
             mime_type = user.get('profile_photo_type', 'image/jpeg')
             profile_image = f"data:{mime_type};base64,{user['profile_photo']}"
 
+        # Get active challenge
         active_challenge = None
         if user.get('current_challenge'):
-            challenge = db.challenges.find_one({'_id': ObjectId(user['current_challenge'])})
+            challenge = db.challenges.find_one({
+                '_id': ObjectId(user['current_challenge']),
+                'user_id': ObjectId(user_id)
+            })
             if challenge:
                 active_challenge = convert_object_ids(challenge)
 
+        # Get completed challenges
         completed_challenges = []
         challenges_cursor = db.challenges.find({
             'user_id': ObjectId(user_id),
             'status': 'completed'
-        })
+        }).sort('created_at', -1)
+        
         for challenge in challenges_cursor:
             completed_challenges.append(convert_object_ids(challenge))
 
+        # Build user response
+        user_response = convert_object_ids(user)
+        user_response["profileImage"] = profile_image
+        
+        # Ensure all required fields exist
+        user_response.setdefault("followers", [])
+        user_response.setdefault("following", [])
+        user_response.setdefault("total_points", 0)
+        user_response.setdefault("bio", "")
+
         return jsonify({
-            "user": {
-                **convert_object_ids(user),
-                "profileImage": profile_image
-            },
+            "user": user_response,
             "active_challenge": active_challenge,
             "completed_challenges": completed_challenges
         }), 200
+        
     except Exception as e:
         app.logger.error(f"My profile error: {str(e)}", exc_info=True)
         return jsonify({'error': str(e)}), 500
+        
 
 # ---------------- UPDATE PROFILE IMAGE ----------------
 
@@ -740,4 +783,5 @@ def unfollow_user(user_id):
 
 if __name__ == "__main__":
     app.run(debug=True)
+
 
