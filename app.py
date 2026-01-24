@@ -83,6 +83,10 @@ def convert_object_ids(obj):
             return str(obj)
     return obj
 # ---------------- AUTH ----------------
+@app.route('/')
+def health():
+    print("backend is running")
+    return "Backend is running"
 
 @app.route('/api/auth/signup', methods=['POST'])
 def signup():
@@ -783,5 +787,6 @@ def unfollow_user(user_id):
 
 if __name__ == "__main__":
     app.run(debug=True)
+
 
 
