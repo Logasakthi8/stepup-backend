@@ -302,7 +302,20 @@ class Challenge:
             # Refresh the challenge
             challenge = self.collection.find_one({"_id": challenge["_id"]})
         
-        return convert_object_ids(challenge)
+        # Convert to JSON serializable format
+        converted_challenge = convert_object_ids(challenge)
+        
+        # Ensure all required fields exist
+        converted_challenge.setdefault("calendar_days", [])
+        converted_challenge.setdefault("current_day", 1)
+        converted_challenge.setdefault("duration", 30)
+        converted_challenge.setdefault("daily_post_time", "19:00")
+        converted_challenge.setdefault("time_window_minutes", 60)
+        converted_challenge.setdefault("total_points", 0)
+        converted_challenge.setdefault("description", "")
+        converted_challenge.setdefault("calendarDays", converted_challenge.get("calendar_days", []))
+        
+        return converted_challenge
     
     def check_posting_availability(self, user_id: str) -> Dict[str, Any]:
         """Check if user can post today based on current IST time."""
@@ -311,7 +324,13 @@ class Challenge:
             return {
                 "allowed": False,
                 "reason": "no_active_challenge",
-                "message": "No active challenge found"
+                "message": "No active challenge found",
+                "already_posted": False,
+                "window_start": None,
+                "window_end": None,
+                "timezone": "Asia/Kolkata",
+                "current_day": 1,
+                "daily_points": 100
             }
         
         now_ist = self._get_user_now()
@@ -335,7 +354,13 @@ class Challenge:
             return {
                 "allowed": False,
                 "reason": "no_valid_day",
-                "message": "No valid challenge day found"
+                "message": "No valid challenge day found",
+                "already_posted": False,
+                "window_start": None,
+                "window_end": None,
+                "timezone": "Asia/Kolkata",
+                "current_day": challenge.get("current_day", 1),
+                "daily_points": 100
             }
         
         # Get day details
@@ -343,38 +368,23 @@ class Challenge:
         day_date_str = today_entry.get("date")
         day_status = today_entry.get("status", "pending")
         
-        # Check if this day is today or in the future
-        try:
-            day_date = date.fromisoformat(day_date_str)
-        except ValueError:
-            day_date = now_ist.date()
-        
-        # If day is in the future, user cannot post yet
-        if day_date > now_ist.date():
-            next_window_start = datetime.fromisoformat(today_entry.get("window_start_ist"))
-            if next_window_start.tzinfo is None:
-                next_window_start = self.ist_tz.localize(next_window_start)
-            
-            hours_until = (next_window_start - now_ist).total_seconds() / 3600
-            return {
-                "allowed": False,
-                "reason": "future_day",
-                "message": f"This is day {day_number}, posting window opens on {day_date_str}",
-                "day_number": day_number,
-                "target_date": day_date_str,
-                "hours_until_window": hours_until,
-                "already_posted": False
-            }
-        
         # Check if day is already completed or missed
         if day_status in ["completed", "missed"]:
+            window_start = today_entry.get("window_start_ist")
+            window_end = today_entry.get("window_end_ist")
+            
             return {
                 "allowed": False,
                 "reason": "day_already_processed",
                 "message": f"Day {day_number} is already {day_status}",
                 "day_number": day_number,
                 "day_status": day_status,
-                "already_posted": day_status == "completed"
+                "already_posted": day_status == "completed",
+                "window_start": window_start,
+                "window_end": window_end,
+                "timezone": "Asia/Kolkata",
+                "current_day": challenge.get("current_day", 1),
+                "daily_points": 100 + (day_number - 1) * 50
             }
         
         # Get window times
@@ -387,28 +397,16 @@ class Challenge:
             window_minutes = challenge.get("time_window_minutes", 60)
             hour, minute = map(int, daily_time.split(':'))
             
-            window_start, window_end = self._calculate_window_times(
-                day_date, hour, minute, window_minutes
-            )
-            window_start_str = window_start.isoformat()
-            window_end_str = window_end.isoformat()
-        
-        # Parse window times
-        try:
-            window_start = datetime.fromisoformat(window_start_str)
-            window_end = datetime.fromisoformat(window_end_str)
-            
-            if window_start.tzinfo is None:
-                window_start = self.ist_tz.localize(window_start)
-            if window_end.tzinfo is None:
-                window_end = self.ist_tz.localize(window_end)
-        except Exception as e:
-            return {
-                "allowed": False,
-                "reason": "invalid_window_times",
-                "message": f"Invalid window times: {str(e)}",
-                "day_number": day_number
-            }
+            try:
+                day_date = date.fromisoformat(day_date_str)
+                window_start, window_end = self._calculate_window_times(
+                    day_date, hour, minute, window_minutes
+                )
+                window_start_str = window_start.isoformat()
+                window_end_str = window_end.isoformat()
+            except Exception:
+                window_start_str = None
+                window_end_str = None
         
         # Check if already posted today
         user_oid = safe_objectid(user_id)
@@ -418,7 +416,13 @@ class Challenge:
             return {
                 "allowed": False,
                 "reason": "invalid_ids",
-                "message": "Invalid user or challenge ID"
+                "message": "Invalid user or challenge ID",
+                "already_posted": False,
+                "window_start": window_start_str,
+                "window_end": window_end_str,
+                "timezone": "Asia/Kolkata",
+                "current_day": challenge.get("current_day", 1),
+                "daily_points": 100 + (day_number - 1) * 50
             }
         
         # Check for existing post for this day
@@ -435,79 +439,106 @@ class Challenge:
                 "message": f"You have already posted for day {day_number}",
                 "day_number": day_number,
                 "already_posted": True,
-                "window_start": window_start.isoformat(),
-                "window_end": window_end.isoformat(),
+                "window_start": window_start_str,
+                "window_end": window_end_str,
                 "timezone": "Asia/Kolkata",
                 "current_day": day_number,
                 "daily_points": 100 + (day_number - 1) * 50
             }
         
         # Check if within window
-        if window_start <= now_ist <= window_end:
-            minutes_remaining = max(0, int((window_end - now_ist).total_seconds() / 60))
-            return {
-                "allowed": True,
-                "reason": "within_window",
-                "message": f"You can post now for day {day_number}! Window closes in {minutes_remaining} minutes.",
-                "day_number": day_number,
-                "already_posted": False,
-                "window_start": window_start.isoformat(),
-                "window_end": window_end.isoformat(),
-                "timezone": "Asia/Kolkata",
-                "current_day": day_number,
-                "daily_points": 100 + (day_number - 1) * 50,
-                "minutes_remaining": minutes_remaining
-            }
-        elif now_ist < window_start:
-            minutes_until = max(0, int((window_start - now_ist).total_seconds() / 60))
-            return {
-                "allowed": False,
-                "reason": "before_window",
-                "message": f"Posting window for day {day_number} opens in {minutes_until} minutes",
-                "day_number": day_number,
-                "already_posted": False,
-                "window_start": window_start.isoformat(),
-                "window_end": window_end.isoformat(),
-                "timezone": "Asia/Kolkata",
-                "current_day": day_number,
-                "daily_points": 100 + (day_number - 1) * 50,
-                "time_until_window_minutes": minutes_until
-            }
-        else:
-            # Window has passed - mark as missed
-            if day_status == "pending":
-                # Update calendar day to missed
-                calendar_days = challenge.get("calendar_days", [])
-                for i, day in enumerate(calendar_days):
-                    if day.get("day_number") == day_number:
-                        calendar_days[i]["status"] = "missed"
-                        calendar_days[i]["points_earned"] = 0
-                        break
+        if window_start_str and window_end_str:
+            try:
+                window_start = datetime.fromisoformat(window_start_str)
+                window_end = datetime.fromisoformat(window_end_str)
                 
-                # Update challenge in database
-                self.collection.update_one(
-                    {"_id": challenge["_id"]},
-                    {
-                        "$set": {
-                            "calendar_days": calendar_days,
-                            "updated_at": datetime.utcnow()
-                        }
+                if window_start.tzinfo is None:
+                    window_start = self.ist_tz.localize(window_start)
+                if window_end.tzinfo is None:
+                    window_end = self.ist_tz.localize(window_end)
+                
+                if window_start <= now_ist <= window_end:
+                    minutes_remaining = max(0, int((window_end - now_ist).total_seconds() / 60))
+                    return {
+                        "allowed": True,
+                        "reason": "within_window",
+                        "message": f"You can post now for day {day_number}! Window closes in {minutes_remaining} minutes.",
+                        "day_number": day_number,
+                        "already_posted": False,
+                        "window_start": window_start_str,
+                        "window_end": window_end_str,
+                        "timezone": "Asia/Kolkata",
+                        "current_day": day_number,
+                        "daily_points": 100 + (day_number - 1) * 50,
+                        "minutes_remaining": minutes_remaining
                     }
-                )
-            
-            return {
-                "allowed": False,
-                "reason": "after_window",
-                "message": f"Posting window for day {day_number} has ended",
-                "day_number": day_number,
-                "already_posted": False,
-                "window_start": window_start.isoformat(),
-                "window_end": window_end.isoformat(),
-                "timezone": "Asia/Kolkata",
-                "current_day": day_number,
-                "daily_points": 100 + (day_number - 1) * 50,
-                "day_status": "missed"
-            }
+                elif now_ist < window_start:
+                    minutes_until = max(0, int((window_start - now_ist).total_seconds() / 60))
+                    return {
+                        "allowed": False,
+                        "reason": "before_window",
+                        "message": f"Posting window for day {day_number} opens in {minutes_until} minutes",
+                        "day_number": day_number,
+                        "already_posted": False,
+                        "window_start": window_start_str,
+                        "window_end": window_end_str,
+                        "timezone": "Asia/Kolkata",
+                        "current_day": day_number,
+                        "daily_points": 100 + (day_number - 1) * 50,
+                        "time_until_window_minutes": minutes_until
+                    }
+                else:
+                    # Window has passed - mark as missed
+                    if day_status == "pending":
+                        # Update calendar day to missed
+                        calendar_days = challenge.get("calendar_days", [])
+                        for i, day in enumerate(calendar_days):
+                            if day.get("day_number") == day_number:
+                                calendar_days[i]["status"] = "missed"
+                                calendar_days[i]["points_earned"] = 0
+                                break
+                        
+                        # Update challenge in database
+                        self.collection.update_one(
+                            {"_id": challenge_oid},
+                            {
+                                "$set": {
+                                    "calendar_days": calendar_days,
+                                    "updated_at": datetime.utcnow()
+                                }
+                            }
+                        )
+                    
+                    return {
+                        "allowed": False,
+                        "reason": "after_window",
+                        "message": f"Posting window for day {day_number} has ended",
+                        "day_number": day_number,
+                        "already_posted": False,
+                        "window_start": window_start_str,
+                        "window_end": window_end_str,
+                        "timezone": "Asia/Kolkata",
+                        "current_day": day_number,
+                        "daily_points": 100 + (day_number - 1) * 50,
+                        "day_status": "missed"
+                    }
+            except Exception as e:
+                # If window parsing fails, return generic error
+                pass
+        
+        # If we get here, there's an issue with window times
+        return {
+            "allowed": False,
+            "reason": "invalid_window",
+            "message": "Unable to determine posting window",
+            "day_number": day_number,
+            "already_posted": False,
+            "window_start": window_start_str,
+            "window_end": window_end_str,
+            "timezone": "Asia/Kolkata",
+            "current_day": day_number,
+            "daily_points": 100 + (day_number - 1) * 50
+        }
     
     def update_challenge_day(self, challenge_id: str, day_number: int, 
                          post_id: str, points: int = 100) -> Dict[str, Any]:
