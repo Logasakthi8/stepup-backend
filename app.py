@@ -12,30 +12,44 @@ from bson import ObjectId
 import json
 import base64
 import pytz
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
 
 app = Flask(__name__)
-CORS(
-    app,
-    resources={r"/api/*": {"origins": "*"}},
-    supports_credentials=True,
-    allow_headers=["Authorization"],
-    expose_headers=["Authorization"]
-)
+
+# CORS Configuration - Fix this
+CORS(app, 
+     resources={r"/api/*": {
+         "origins": "*",
+         "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+         "allow_headers": ["Content-Type", "Authorization", "X-User-Timezone"],
+         "expose_headers": ["Authorization"]
+     }},
+     supports_credentials=True)
 
 # JWT Configuration
 app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY')
-
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(days=7)
 jwt = JWTManager(app)
 
 # MongoDB Configuration
 mongodb_uri = os.getenv('MONGODB_URI')
+logger.info(f"MongoDB URI: {mongodb_uri[:20]}...")
 
-client = MongoClient(mongodb_uri)
-db = client['discipline_builder']
+try:
+    client = MongoClient(mongodb_uri, serverSelectionTimeoutMS=5000)
+    client.server_info()  # Test connection
+    db = client['discipline_builder']
+    logger.info("✅ MongoDB connected successfully")
+except Exception as e:
+    logger.error(f"❌ MongoDB connection failed: {e}")
+    raise
 
 # Initialize models
 from models import User, Challenge, Post, Follow
@@ -54,15 +68,12 @@ def convert_object_ids(obj):
     elif isinstance(obj, dict):
         result = {}
         for key, value in obj.items():
-            if key == '_id' and isinstance(value, ObjectId):
-                result[key] = str(value)
-            elif isinstance(value, ObjectId):
-                # Keep ObjectId as string for all fields
+            if isinstance(value, ObjectId):
                 result[key] = str(value)
             elif isinstance(value, datetime):
                 result[key] = value.isoformat()
             elif isinstance(value, bytes):
-                # Handle bytes specifically for images
+                # For image data, keep as string
                 try:
                     result[key] = value.decode('utf-8', errors='ignore')
                 except:
@@ -82,7 +93,8 @@ def convert_object_ids(obj):
         except:
             return str(obj)
     return obj
-# ---------------- AUTH ----------------
+
+# ================ AUTH ================
 
 @app.route('/api/auth/signup', methods=['POST'])
 def signup():
@@ -109,8 +121,8 @@ def signup():
         }), 201
 
     except Exception as e:
-        app.logger.error(f"Signup error: {str(e)}", exc_info=True)
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Signup error: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Internal server error'}), 500
 
 @app.route('/api/auth/login', methods=['POST'])
 def login():
@@ -126,17 +138,24 @@ def login():
         token = create_access_token(identity=str(user['_id']))
         user['password'] = None
 
+        # Ensure all required fields exist
+        user_response = convert_object_ids(user)
+        user_response.setdefault('followers', [])
+        user_response.setdefault('following', [])
+        user_response.setdefault('total_points', 0)
+        user_response.setdefault('bio', '')
+
         return jsonify({
             'message': 'Login successful',
-            'user': convert_object_ids(user),
+            'user': user_response,
             'token': token
         }), 200
 
     except Exception as e:
-        app.logger.error(f"Login error: {str(e)}", exc_info=True)
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Login error: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Internal server error'}), 500
 
-# ---------------- CHALLENGE ----------------
+# ================ CHALLENGE ================
 
 @app.route('/api/challenge/create', methods=['POST'])
 @jwt_required()
@@ -144,6 +163,7 @@ def create_challenge():
     try:
         data = request.get_json()
         user_id = get_jwt_identity()
+        logger.info(f"Creating challenge for user: {user_id}")
 
         # Check for existing active challenge
         existing = challenge_model.get_user_challenge(user_id)
@@ -160,7 +180,7 @@ def create_challenge():
         if not data.get('daily_post_time'):
             return jsonify({'error': 'Daily post time is required'}), 400
 
-        # Create challenge with IST timezone (ignores user_timezone from frontend)
+        # Create challenge
         challenge = challenge_model.create_challenge(
             user_id=user_id,
             challenge_name=data['challenge_name'],
@@ -176,14 +196,15 @@ def create_challenge():
             {'$set': {'current_challenge': ObjectId(challenge['_id'])}}
         )
 
+        logger.info(f"Challenge created: {challenge.get('_id')}")
         return jsonify({'challenge': challenge}), 201
 
     except ValueError as e:
-        app.logger.error(f"Validation error in create_challenge: {str(e)}")
+        logger.error(f"Validation error: {str(e)}")
         return jsonify({'error': str(e)}), 400
     except Exception as e:
-        app.logger.error(f"Create challenge error: {str(e)}", exc_info=True)
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Create challenge error: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Failed to create challenge'}), 500
 
 
 @app.route('/api/challenge/current', methods=['GET'])
@@ -191,15 +212,19 @@ def create_challenge():
 def get_current_challenge():
     try:
         user_id = get_jwt_identity()
+        logger.info(f"Getting current challenge for user: {user_id}")
+        
         challenge = challenge_model.get_user_challenge(user_id)
 
         if not challenge:
+            logger.info(f"No active challenge for user: {user_id}")
             return jsonify({'message': 'No active challenge'}), 404
 
+        logger.info(f"Found challenge: {challenge.get('_id')}")
         return jsonify({'challenge': challenge}), 200
     except Exception as e:
-        app.logger.error(f"Get current challenge error: {str(e)}", exc_info=True)
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Get current challenge error: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Failed to load challenge'}), 500
 
 
 @app.route('/api/challenge/calendar', methods=['GET'])
@@ -220,31 +245,33 @@ def get_challenge_calendar():
             'current_day': challenge['current_day']
         }), 200
     except Exception as e:
-        app.logger.error(f"Get calendar error: {str(e)}", exc_info=True)
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Get calendar error: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Failed to load calendar'}), 500
 
-# ---------------- POSTS ----------------
+# ================ POSTS ================
+
 @app.route('/api/post/create', methods=['POST'])
 @jwt_required()
 def create_post():
     try:
         user_id = get_jwt_identity()
         data = request.get_json(silent=True) or {}
+        logger.info(f"Creating post for user: {user_id}")
 
         # 1️⃣ Get user's active challenge
         challenge = challenge_model.get_user_challenge(user_id)
         if not challenge:
             return jsonify({'error': 'No active challenge found'}), 400
 
-        # 2️⃣ Check posting availability (IST)
+        # 2️⃣ Check posting availability
         availability = challenge_model.check_posting_availability(user_id)
-        if not availability['allowed']:
+        if not availability.get('allowed'):
             return jsonify({
                 'error': availability.get('message', 'Cannot post at this time'),
                 'reason': availability.get('reason', 'unknown')
             }), 400
 
-        current_day = challenge['current_day']
+        current_day = challenge.get('current_day', 1)
         points = 100 + (current_day - 1) * 50
 
         # 3️⃣ Extract image data
@@ -261,7 +288,7 @@ def create_post():
             except Exception:
                 pass
 
-        # 4️⃣ Create post (raw)
+        # 4️⃣ Create post
         post = post_model.create_post(
             user_id=user_id,
             challenge_id=str(challenge['_id']),
@@ -271,36 +298,36 @@ def create_post():
             image_type=image_type
         )
 
-        # 5️⃣ Update challenge progress
-        
+        # Check if post creation failed
+        if 'error' in post:
+            return jsonify({'error': post['error']}), 400
 
-        # 6️⃣ Update user points
-        
-        # ================================
-        # 🔥 HYDRATE POST (FEED FORMAT)
-        # ================================
-
+        # 5️⃣ Get user and challenge info
         user = user_model.find_by_id(user_id)
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
 
         challenge_data = challenge_model.collection.find_one(
             {'_id': ObjectId(challenge['_id'])}
         )
 
+        # 6️⃣ Format image URL
         image_data = None
         if post.get('image_url'):
             mime = post.get('image_type', 'image/jpeg')
             image_data = f"data:{mime};base64,{post['image_url']}"
 
+        # 7️⃣ Create hydrated post
         hydrated_post = {
             **convert_object_ids(post),
             "image_url": image_data,
             "user_name": user.get("name", "Unknown User"),
             "profile_photo": user.get("profile_photo"),
-            "challenge_name": challenge_data.get("challenge_name"),
+            "challenge_name": challenge_data.get("challenge_name") if challenge_data else "",
             "is_boosted_by_user": False,
-            "boosts_count": 0,
-            "comment_count": 0,
-            "comments": []
+            "boosts_count": post.get('boosts_count', 0),
+            "comment_count": post.get('comment_count', 0),
+            "comments": post.get('comments', [])
         }
 
         return jsonify({
@@ -310,10 +337,9 @@ def create_post():
             "current_day": current_day + 1
         }), 201
 
-
     except Exception as e:
-        app.logger.error(f"Create post error: {str(e)}", exc_info=True)
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Create post error: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Failed to create post'}), 500
 
 
 @app.route('/api/post/check-availability', methods=['GET'])
@@ -324,8 +350,8 @@ def check_posting_availability():
         availability = challenge_model.check_posting_availability(user_id)
         return jsonify(availability), 200
     except Exception as e:
-        app.logger.error(f"Check availability error: {str(e)}", exc_info=True)
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Check availability error: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Failed to check availability'}), 500
 
 @app.route('/api/post/<post_id>/boost', methods=['POST'])
 @jwt_required()
@@ -335,18 +361,17 @@ def boost_post(post_id):
         result = post_model.boost_post(post_id, user_id)
         
         if result:
-            converted_result = convert_object_ids(result)
             return jsonify({
-                'message': f'Post {converted_result.get("action", "updated")} successfully',
-                'boosts_count': converted_result.get('boosts_count', 0),
-                'is_boosted': converted_result.get('is_boosted', False)
+                'message': f'Post {result.get("action", "updated")} successfully',
+                'boosts_count': result.get('boosts_count', 0),
+                'is_boosted': result.get('is_boosted', False)
             }), 200
         else:
             return jsonify({'error': 'Post not found'}), 404
             
     except Exception as e:
-        app.logger.error(f"Boost error: {str(e)}", exc_info=True)
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Boost error: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Failed to boost post'}), 500
     
 @app.route('/api/post/<post_id>/comment', methods=['POST'])
 @jwt_required()
@@ -355,35 +380,26 @@ def add_comment(post_id):
         user_id = get_jwt_identity()
         data = request.get_json()
         
-        app.logger.info(f"Comment request data: {data}")
-        app.logger.info(f"User ID: {user_id}, Post ID: {post_id}")
-        
-        comment_text = None
-        if data:
-            comment_text = data.get('text') or data.get('comment')
-        
-        app.logger.info(f"Extracted comment text: {comment_text}")
+        comment_text = data.get('text') or data.get('comment')
         
         if not comment_text or not str(comment_text).strip():
             return jsonify({'error': 'Comment text is required'}), 400
         
         result = post_model.add_comment(post_id, user_id, comment_text)
         
-        app.logger.info(f"Comment result: {result}")
-        
         if result:
-            converted_result = convert_object_ids(result)
             return jsonify({
                 'message': 'Comment added successfully',
-                'comments': converted_result.get('comments', []),
-                'comment_count': converted_result.get('comment_count', 0)
+                'comments': result.get('comments', []),
+                'comment_count': result.get('comment_count', 0)
             }), 200
         else:
             return jsonify({'error': 'Failed to add comment'}), 400
             
     except Exception as e:
-        app.logger.error(f"Comment error: {str(e)}", exc_info=True)
-        return jsonify({'error': f'Server error: {str(e)}'}), 500
+        logger.error(f"Comment error: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Failed to add comment'}), 500
+
 @app.route('/api/feed', methods=['GET'])
 @jwt_required()
 def get_feed():
@@ -392,6 +408,8 @@ def get_feed():
         page = request.args.get('page', 1, type=int)
         limit = request.args.get('limit', 20, type=int)
         skip = (page - 1) * limit
+        
+        logger.info(f"Getting feed for user {user_id}, page {page}, limit {limit}")
 
         query = {
             '$or': [
@@ -401,6 +419,7 @@ def get_feed():
         }
 
         total_posts = post_model.collection.count_documents(query)
+        logger.info(f"Total posts in DB: {total_posts}")
 
         posts_cursor = (
             post_model.collection
@@ -411,18 +430,21 @@ def get_feed():
         )
 
         enriched = []
+        post_count = 0
 
         for post in posts_cursor:
             try:
-                # Convert ObjectId first
+                post_count += 1
                 post_dict = convert_object_ids(post)
 
                 post_user_id = post_dict.get('user_id')
                 if not post_user_id:
+                    logger.warning(f"Post {post_dict.get('_id')} has no user_id")
                     continue
 
                 user = user_model.find_by_id(str(post_user_id))
                 if not user:
+                    logger.warning(f"User {post_user_id} not found for post {post_dict.get('_id')}")
                     continue
 
                 # Get challenge info
@@ -432,27 +454,25 @@ def get_feed():
                         {'_id': ObjectId(post_dict['challenge_id'])}
                     )
                 
-                # ✅ FIX: Proper image data handling
+                # Image data handling
                 image_data = None
                 if post_dict.get('image_url'):
-                    # Check if it's a base64 string
                     image_url = post_dict.get('image_url')
                     if isinstance(image_url, str):
                         if image_url.startswith('data:'):
                             image_data = image_url
                         else:
-                            # It's a base64 string without data URI
                             mime_type = post_dict.get('image_type', 'image/jpeg')
                             image_data = f"data:{mime_type};base64,{image_url}"
                 
-                # Get description
+                # Description
                 description = post_dict.get('description') or post_dict.get('content') or ''
                 
                 # Boost state
                 boosts = post_dict.get('boosts', [])
-                is_boosted_by_user = str(user_id) in boosts
+                is_boosted_by_user = str(user_id) in [str(b) for b in boosts]
 
-                # ✅ FIX: Add challenge details even if None
+                # Challenge name
                 challenge_name = None
                 if challenge:
                     challenge = convert_object_ids(challenge)
@@ -470,7 +490,7 @@ def get_feed():
                     "profile_photo": user.get("profile_photo"),
                     "challenge_name": challenge_name,
                     "points_earned": post_dict.get("points_earned", 0),
-                    "total_points": post_dict.get("total_points", 0),
+                    "total_points": challenge.get("total_points", 0) if challenge else 0,
                     "is_boosted_by_user": is_boosted_by_user,
                     "boosts": boosts,
                     "boosts_count": len(boosts),
@@ -480,8 +500,10 @@ def get_feed():
                 })
 
             except Exception as e:
-                app.logger.error(f"Feed post error: {str(e)}", exc_info=True)
+                logger.error(f"Error processing post: {str(e)}")
                 continue
+
+        logger.info(f"Successfully enriched {len(enriched)} posts")
 
         return jsonify({
             "posts": enriched,
@@ -494,9 +516,10 @@ def get_feed():
         }), 200
 
     except Exception as e:
-        app.logger.error(f"Feed error: {str(e)}", exc_info=True)
+        logger.error(f"Feed error: {str(e)}", exc_info=True)
         return jsonify({
-            "error": "Failed to load feed"
+            "error": "Failed to load feed",
+            "details": str(e)
         }), 500
         
 @app.route('/api/post/<post_id>', methods=['DELETE'])
@@ -507,10 +530,10 @@ def delete_post(post_id):
         result, status = post_model.delete_post_by_user(post_id, user_id)
         return jsonify(result), status
     except Exception as e:
-        app.logger.error(f"Delete post error: {str(e)}", exc_info=True)
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Delete post error: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Failed to delete post'}), 500
 
-# ---------------- USERS ----------------
+# ================ USERS ================
 
 @app.route('/api/users', methods=['GET'])
 @jwt_required()
@@ -518,16 +541,23 @@ def get_users():
     try:
         current_user_id = get_jwt_identity()
 
-        # Find all users except current user
-        users_cursor = db.users.find(
-            {"_id": {"$ne": ObjectId(current_user_id)}},
-            {"password": 0}
+        page = request.args.get('page', 1, type=int)
+        limit = request.args.get('limit', 15, type=int)
+        skip = (page - 1) * limit
+
+        query = {"_id": {"$ne": ObjectId(current_user_id)}}
+
+        total = db.users.count_documents(query)
+
+        users_cursor = (
+            db.users.find(query, {"password": 0})
+            .skip(skip)
+            .limit(limit)
         )
 
         users = []
 
         for user in users_cursor:
-            # Get active challenge details
             active_challenge = None
             if user.get("current_challenge"):
                 challenge = db.challenges.find_one(
@@ -542,40 +572,43 @@ def get_users():
                         "total_points": challenge.get("total_points", 0),
                         "status": challenge.get("status", "active")
                     }
-            
-            # Convert followers/following to string lists
-            followers = [str(follower_id) for follower_id in user.get("followers", [])]
-            following = [str(following_id) for following_id in user.get("following", [])]
-            
-            # Create user object
-            user_obj = {
+
+            users.append({
                 "_id": str(user["_id"]),
                 "name": user.get("name", ""),
                 "email": user.get("email", ""),
                 "bio": user.get("bio", ""),
                 "profile_photo": user.get("profile_photo"),
-                "followers": followers,
-                "following": following,
+                "followers": [str(f) for f in user.get("followers", [])],
+                "following": [str(f) for f in user.get("following", [])],
                 "total_points": user.get("total_points", 0),
                 "active_challenge": active_challenge,
                 "isVerified": user.get("isVerified", False)
-            }
-            
-            users.append(user_obj)
+            })
 
-        return jsonify({"users": users}), 200
+        return jsonify({
+            "users": users,
+            "pagination": {
+                "page": page,
+                "limit": limit,
+                "total": total,
+                "has_more": (skip + limit) < total
+            }
+        }), 200
 
     except Exception as e:
-        app.logger.error(f"Get users error: {str(e)}", exc_info=True)
-        return jsonify({"error": "Failed to fetch users", "details": str(e)}), 500
-        
-# ---------------- MY PROFILE ----------------
+        logger.error(f"Get users error: {str(e)}", exc_info=True)
+        return jsonify({"error": "Failed to fetch users"}), 500
+
+# ================ MY PROFILE ================
 
 @app.route('/api/user/profile', methods=['GET'])
 @jwt_required()
 def my_profile():
     try:
         user_id = get_jwt_identity()
+        logger.info(f"Getting profile for user: {user_id}")
+        
         user = user_model.find_by_id(user_id)
 
         if not user:
@@ -610,7 +643,7 @@ def my_profile():
         for challenge in challenges_cursor:
             completed_challenges.append(convert_object_ids(challenge))
 
-        # Build user response
+        # Build user response with all required fields
         user_response = convert_object_ids(user)
         user_response["profileImage"] = profile_image
         
@@ -619,7 +652,9 @@ def my_profile():
         user_response.setdefault("following", [])
         user_response.setdefault("total_points", 0)
         user_response.setdefault("bio", "")
+        user_response.setdefault("isVerified", False)
 
+        logger.info(f"Profile loaded successfully for user: {user_id}")
         return jsonify({
             "user": user_response,
             "active_challenge": active_challenge,
@@ -627,11 +662,11 @@ def my_profile():
         }), 200
         
     except Exception as e:
-        app.logger.error(f"My profile error: {str(e)}", exc_info=True)
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"My profile error: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Failed to load profile'}), 500
         
 
-# ---------------- UPDATE PROFILE IMAGE ----------------
+# ================ UPDATE PROFILE IMAGE ================
 
 @app.route('/api/user/profile/image', methods=['PUT'])
 @jwt_required()
@@ -642,8 +677,6 @@ def update_profile_photo():
 
         if not user:
             return jsonify({'error': 'User not found'}), 404
-
-        app.logger.info(f"FILES 👉 {request.files}")
 
         file = request.files.get('profile_photo')
         if not file:
@@ -678,10 +711,11 @@ def update_profile_photo():
             }
         }), 200
     except Exception as e:
-        app.logger.error(f"Update profile photo error: {str(e)}", exc_info=True)
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Update profile photo error: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Failed to update profile photo'}), 500
 
-# ---------------- GET USER BY ID ----------------
+# ================ GET USER BY ID ================
+
 @app.route('/api/users/<user_id>', methods=['GET'])
 @jwt_required()
 def get_user_by_id(user_id):
@@ -713,36 +747,45 @@ def get_user_by_id(user_id):
         for challenge in challenges_cursor:
             completed_challenges.append(convert_object_ids(challenge))
 
+        # Build user response with all required fields
+        user_response = convert_object_ids(user)
+        user_response["profileImage"] = profile_image
+        user_response.setdefault("followers", [])
+        user_response.setdefault("following", [])
+        user_response.setdefault("total_points", 0)
+        user_response.setdefault("bio", "")
+        user_response.setdefault("isVerified", False)
+
         return jsonify({
-            "user": {
-                **convert_object_ids(user),
-                "profileImage": profile_image
-            },
+            "user": user_response,
             "active_challenge": active_challenge,
             "completed_challenges": completed_challenges
         }), 200
 
     except Exception as e:
-        app.logger.error(f"Get user by ID error: {str(e)}", exc_info=True)
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Get user by ID error: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Failed to load user'}), 500
 
-# ---------------- HEALTH ----------------
+# ================ HEALTH ================
+
 @app.route('/api/health', methods=['GET'])
 def health():
     try:
         db.command('ping')
         return jsonify({
             'status': 'healthy',
-            'database': 'connected'
+            'database': 'connected',
+            'timestamp': datetime.utcnow().isoformat()
         }), 200
     except Exception as e:
         return jsonify({
             'status': 'unhealthy',
             'database': 'disconnected',
-            'error': str(e)
+            'error': str(e),
+            'timestamp': datetime.utcnow().isoformat()
         }), 500
 
-# ---------------- FOLLOW USER ----------------
+# ================ FOLLOW USER ================
 
 @app.route('/api/user/follow/<user_id>', methods=['POST'])
 @jwt_required()
@@ -761,8 +804,8 @@ def follow_user(user_id):
         return jsonify({'success': True, 'message': 'User followed successfully'}), 200
 
     except Exception as e:
-        app.logger.error(f"Follow user error: {str(e)}", exc_info=True)
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Follow user error: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Failed to follow user'}), 500
 
 @app.route('/api/user/unfollow/<user_id>', methods=['POST'])
 @jwt_required()
@@ -778,11 +821,23 @@ def unfollow_user(user_id):
         return jsonify({'success': True, 'message': 'User unfollowed successfully'}), 200
 
     except Exception as e:
-        app.logger.error(f"Unfollow user error: {str(e)}", exc_info=True)
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Unfollow user error: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Failed to unfollow user'}), 500
+
+# ================ TEST ENDPOINT ================
+
+@app.route('/api/test', methods=['GET'])
+def test_endpoint():
+    """Simple test endpoint to verify the server is running"""
+    return jsonify({
+        "message": "Backend is running",
+        "status": "success",
+        "timestamp": datetime.utcnow().isoformat()
+    }), 200
 
 if __name__ == "__main__":
     app.run(debug=True)
+
 
 
 
