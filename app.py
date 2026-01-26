@@ -540,24 +540,19 @@ def delete_post(post_id):
 def get_users():
     try:
         current_user_id = get_jwt_identity()
+        logger.info(f"Getting users for current user: {current_user_id}")
 
-        page = request.args.get('page', 1, type=int)
-        limit = request.args.get('limit', 15, type=int)
-        skip = (page - 1) * limit
-
-        query = {"_id": {"$ne": ObjectId(current_user_id)}}
-
-        total = db.users.count_documents(query)
-
-        users_cursor = (
-            db.users.find(query, {"password": 0})
-            .skip(skip)
-            .limit(limit)
+        users_cursor = db.users.find(
+            {"_id": {"$ne": ObjectId(current_user_id)}},
+            {"password": 0}
         )
 
         users = []
+        user_count = 0
 
         for user in users_cursor:
+            user_count += 1
+            # Get active challenge details
             active_challenge = None
             if user.get("current_challenge"):
                 challenge = db.challenges.find_one(
@@ -572,34 +567,34 @@ def get_users():
                         "total_points": challenge.get("total_points", 0),
                         "status": challenge.get("status", "active")
                     }
-
-            users.append({
+            
+            # Convert followers/following to string lists
+            followers = [str(follower_id) for follower_id in user.get("followers", [])]
+            following = [str(following_id) for following_id in user.get("following", [])]
+            
+            # Create user object with all required fields
+            user_obj = {
                 "_id": str(user["_id"]),
                 "name": user.get("name", ""),
                 "email": user.get("email", ""),
                 "bio": user.get("bio", ""),
                 "profile_photo": user.get("profile_photo"),
-                "followers": [str(f) for f in user.get("followers", [])],
-                "following": [str(f) for f in user.get("following", [])],
+                "followers": followers,
+                "following": following,
                 "total_points": user.get("total_points", 0),
                 "active_challenge": active_challenge,
                 "isVerified": user.get("isVerified", False)
-            })
-
-        return jsonify({
-            "users": users,
-            "pagination": {
-                "page": page,
-                "limit": limit,
-                "total": total,
-                "has_more": (skip + limit) < total
             }
-        }), 200
+            
+            users.append(user_obj)
+
+        logger.info(f"Returning {len(users)} users")
+        return jsonify({"users": users}), 200
 
     except Exception as e:
         logger.error(f"Get users error: {str(e)}", exc_info=True)
         return jsonify({"error": "Failed to fetch users"}), 500
-
+        
 # ================ MY PROFILE ================
 
 @app.route('/api/user/profile', methods=['GET'])
@@ -835,8 +830,10 @@ def test_endpoint():
         "timestamp": datetime.utcnow().isoformat()
     }), 200
 
+
 if __name__ == "__main__":
     app.run(debug=True)
+
 
 
 
