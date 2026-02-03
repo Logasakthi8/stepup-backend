@@ -1,10 +1,9 @@
-from unittest import result
-import bcrypt
-import re
 from datetime import datetime, timedelta, timezone, date
 from bson import ObjectId
 import pytz
 from typing import Optional, Dict, Any, List, Tuple, Union
+import bcrypt
+import re
 
 # ------------------ HELPERS ------------------
 def get_user_local_now(user_timezone_str="Asia/Kolkata"):
@@ -26,6 +25,10 @@ def safe_objectid(val: Union[str, ObjectId, None]) -> Optional[ObjectId]:
         return None
 
 def convert_object_ids(obj):
+    """Recursively convert Mongo ObjectId, datetime, and bytes to JSON-serializable values"""
+    if obj is None:
+        return None
+        
     if isinstance(obj, list):
         return [convert_object_ids(i) for i in obj]
     elif isinstance(obj, dict):
@@ -34,23 +37,43 @@ def convert_object_ids(obj):
             if isinstance(v, ObjectId):
                 result[k] = str(v)
             elif isinstance(v, datetime):
+                # Ensure datetime is timezone-aware for JSON serialization
+                if v.tzinfo is None:
+                    v = v.replace(tzinfo=timezone.utc)
                 result[k] = v.isoformat()
             elif isinstance(v, bytes):
-                result[k] = v.decode('utf-8', errors='ignore')
+                try:
+                    result[k] = v.decode('utf-8', errors='ignore')
+                except:
+                    result[k] = str(v)
             elif isinstance(v, (dict, list)):
                 result[k] = convert_object_ids(v)
             else:
                 result[k] = v
         return result
+    elif isinstance(obj, ObjectId):
+        return str(obj)
+    elif isinstance(obj, datetime):
+        if obj.tzinfo is None:
+            obj = obj.replace(tzinfo=timezone.utc)
+        return obj.isoformat()
+    elif isinstance(obj, bytes):
+        try:
+            return obj.decode('utf-8', errors='ignore')
+        except:
+            return str(obj)
     return obj
 
 # ------------------ USER ------------------
 
 class User:
     def __init__(self, db):
-        self.collection = db.users
+        self.collection = db.users if db else None
 
     def create_user(self, email, password, name=None, profile_photo=None, profile_photo_type=None):
+        if not self.collection:
+            return None
+            
         hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
         user = {
             "email": email,
@@ -62,31 +85,41 @@ class User:
             "current_challenge": None,
             "followers": [],
             "following": [],
-            "created_at": datetime.utcnow()
+            "bio": "",
+            "isVerified": False,
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow()
         }
         res = self.collection.insert_one(user)
         user["_id"] = res.inserted_id
-        return user
+        return convert_object_ids(user)
 
     def find_by_email(self, email):
+        if not self.collection:
+            return None
         return self.collection.find_one({"email": email})
 
     def find_by_id(self, user_id):
         oid = safe_objectid(user_id)
-        if not oid:
+        if not oid or not self.collection:
             return None
-        return self.collection.find_one({"_id": oid}, {"password": 0})
+        return self.collection.find_one({"_id": oid})
 
     def verify_password(self, hashed_password, password):
+        if not hashed_password:
+            return False
         if isinstance(hashed_password, str):
             hashed_password = hashed_password.encode('utf-8')
-        return bcrypt.checkpw(password.encode(), hashed_password)
+        try:
+            return bcrypt.checkpw(password.encode(), hashed_password)
+        except Exception:
+            return False
 
 # ------------------ CHALLENGE ------------------
 
 class Challenge:
     def __init__(self, db, default_timezone: str = "Asia/Kolkata"):
-        self.collection = db.challenges
+        self.collection = db.challenges if db else None
         self.db = db
         self.default_timezone = default_timezone
         self.ist_tz = pytz.timezone("Asia/Kolkata")
@@ -106,16 +139,22 @@ class Challenge:
         return hour, minute
     
     def _get_user_now(self, user_timezone: str = None) -> datetime:
-        """Get current datetime in user's timezone (always IST)."""
-        return datetime.now(self.ist_tz)
+        """Get current datetime in user's timezone."""
+        try:
+            tz = pytz.timezone(user_timezone or self.default_timezone)
+            return datetime.now(tz)
+        except pytz.exceptions.UnknownTimeZoneError:
+            return datetime.now(self.ist_tz)
     
     def _calculate_window_times(self, target_date: date, hour: int, minute: int, 
                                window_minutes: int) -> Tuple[datetime, datetime]:
-        """Calculate window start and end datetimes in IST for a specific date."""
-        # Create window start for the target date in IST
+        """Calculate window start and end datetimes for a specific date."""
+        # Create window start for the target date
         window_start_naive = datetime.combine(target_date, datetime.min.time()).replace(
             hour=hour, minute=minute, second=0, microsecond=0
         )
+        
+        # Localize to IST
         window_start = self.ist_tz.localize(window_start_naive)
         
         # Calculate window end
@@ -125,7 +164,7 @@ class Challenge:
     
     def _get_today_user_date(self) -> date:
         """Get today's date in IST."""
-        user_now = self._get_user_now()
+        user_now = self._get_user_now(self.default_timezone)
         return user_now.date()
     
     def _get_current_calendar_day(self, challenge: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -145,14 +184,6 @@ class Challenge:
         
         return None
     
-    def _get_day_number_from_date(self, challenge: Dict[str, Any], target_date: date) -> Optional[int]:
-        """Get day number for a specific date."""
-        target_str = target_date.isoformat()
-        for day in challenge.get("calendar_days", []):
-            if day.get("date") == target_str:
-                return day.get("day_number")
-        return None
-    
     # ------------------ PUBLIC METHODS ------------------
     
     def create_challenge(self, user_id: str, challenge_name: str, duration: int, 
@@ -161,6 +192,9 @@ class Challenge:
         """
         Create a new challenge with IST timezone only.
         """
+        if not self.collection:
+            return None
+            
         if not self._validate_time_format(daily_post_time):
             raise ValueError(f"Invalid daily_post_time format: {daily_post_time}. Use HH:MM (24-hour)")
         
@@ -173,7 +207,7 @@ class Challenge:
         target_hour, target_minute = self._parse_time_string(daily_post_time)
         
         # Get current time in IST for start date
-        user_now = self._get_user_now()
+        user_now = self._get_user_now(self.default_timezone)
         start_date = user_now.date()
         
         # Generate calendar days with dates in IST
@@ -209,7 +243,7 @@ class Challenge:
             "daily_post_time": daily_post_time,
             "time_window_minutes": int(time_window_minutes),
             "description": description or "",
-            "user_timezone": "Asia/Kolkata",
+            "user_timezone": self.default_timezone,
             "start_date": start_date.isoformat(),
             "status": "active",
             "total_points": 0,
@@ -224,8 +258,11 @@ class Challenge:
     
     def get_user_challenge(self, user_id: str) -> Optional[Dict[str, Any]]:
         """
-        Get active challenge for a user with proper missed-day calculation in IST.
+        Get active challenge for a user with proper missed-day calculation.
         """
+        if not self.collection:
+            return None
+            
         oid = safe_objectid(user_id)
         if not oid:
             return None
@@ -239,11 +276,13 @@ class Challenge:
         if not challenge:
             return None
         
-        # Get today's date in IST
-        today_ist = self._get_today_user_date()
+        # Get today's date in user's timezone
+        today_date = self._get_today_user_date()
+        now_dt = self._get_user_now(self.default_timezone)
         
         calendar_days = challenge.get("calendar_days", [])
         updated = False
+        found_today = False
         
         for day in calendar_days:
             day_date_str = day.get("date")
@@ -255,8 +294,14 @@ class Challenge:
             except ValueError:
                 continue
             
-            # Only process if day is pending and date has passed
-            if day_date < today_ist and day.get("status") == "pending":
+            day_status = day.get("status", "pending")
+            
+            # Check if this is today's entry
+            if day_date == today_date:
+                found_today = True
+            
+            # Process missed days (date has passed and still pending)
+            if day_date < today_date and day_status == "pending":
                 window_end_str = day.get("window_end_ist")
                 if window_end_str:
                     try:
@@ -264,16 +309,16 @@ class Challenge:
                         if window_end.tzinfo is None:
                             window_end = self.ist_tz.localize(window_end)
                         
-                        current_ist = self._get_user_now()
-                        
-                        # Mark as missed if window has definitely passed in IST
-                        if current_ist > window_end:
+                        # Mark as missed if window has definitely passed
+                        if now_dt > window_end:
                             day["status"] = "missed"
                             day["points_earned"] = 0
                             updated = True
                     except Exception:
-                        # If we can't parse, skip
-                        pass
+                        # If we can't parse, mark as missed based on date only
+                        day["status"] = "missed"
+                        day["points_earned"] = 0
+                        updated = True
         
         # Update current_day based on status
         current_day_calculated = 1
@@ -289,6 +334,11 @@ class Challenge:
         # Ensure current_day doesn't exceed duration
         current_day_calculated = min(current_day_calculated, challenge.get("duration", 1))
         
+        # If we're past the challenge duration, complete it
+        if current_day_calculated > challenge.get("duration", 1):
+            challenge["status"] = "completed"
+            updated = True
+        
         if updated or current_day_calculated != challenge.get("current_day", 1):
             now_utc = datetime.utcnow()
             self.collection.update_one(
@@ -296,6 +346,7 @@ class Challenge:
                 {"$set": {
                     "calendar_days": calendar_days,
                     "current_day": current_day_calculated,
+                    "status": challenge.get("status", "active"),
                     "updated_at": now_utc
                 }}
             )
@@ -313,12 +364,25 @@ class Challenge:
         converted_challenge.setdefault("time_window_minutes", 60)
         converted_challenge.setdefault("total_points", 0)
         converted_challenge.setdefault("description", "")
-        converted_challenge.setdefault("calendarDays", converted_challenge.get("calendar_days", []))
+        converted_challenge.setdefault("start_date", datetime.utcnow().date().isoformat())
+        converted_challenge.setdefault("user_timezone", self.default_timezone)
+        
+        # Add calendarDays for backward compatibility
+        if "calendarDays" not in converted_challenge:
+            converted_challenge["calendarDays"] = converted_challenge.get("calendar_days", [])
         
         return converted_challenge
     
     def check_posting_availability(self, user_id: str) -> Dict[str, Any]:
-        """Check if user can post today based on current IST time."""
+        """Check if user can post today based on current time in user's timezone."""
+        if not self.collection or not self.db:
+            return {
+                "allowed": False,
+                "reason": "database_unavailable",
+                "message": "Database not available",
+                "already_posted": False
+            }
+            
         challenge = self.get_user_challenge(user_id)
         if not challenge:
             return {
@@ -328,29 +392,29 @@ class Challenge:
                 "already_posted": False,
                 "window_start": None,
                 "window_end": None,
-                "timezone": "Asia/Kolkata",
+                "timezone": self.default_timezone,
                 "current_day": 1,
                 "daily_points": 100
             }
         
-        now_ist = self._get_user_now()
-        today_str = now_ist.date().isoformat()
+        now_dt = self._get_user_now(self.default_timezone)
+        today_str = now_dt.date().isoformat()
         
-        # Find today's calendar day
-        today_entry = None
+        # Find today's calendar day or next pending day
+        target_day = None
         for day in challenge.get("calendar_days", []):
             if day.get("date") == today_str:
-                today_entry = day
+                target_day = day
                 break
         
-        if not today_entry:
-            # Find the next pending day
+        # If not found, find first pending day
+        if not target_day:
             for day in challenge.get("calendar_days", []):
                 if day.get("status") == "pending":
-                    today_entry = day
+                    target_day = day
                     break
         
-        if not today_entry:
+        if not target_day:
             return {
                 "allowed": False,
                 "reason": "no_valid_day",
@@ -358,20 +422,20 @@ class Challenge:
                 "already_posted": False,
                 "window_start": None,
                 "window_end": None,
-                "timezone": "Asia/Kolkata",
+                "timezone": self.default_timezone,
                 "current_day": challenge.get("current_day", 1),
                 "daily_points": 100
             }
         
         # Get day details
-        day_number = today_entry.get("day_number", challenge.get("current_day", 1))
-        day_date_str = today_entry.get("date")
-        day_status = today_entry.get("status", "pending")
+        day_number = target_day.get("day_number", challenge.get("current_day", 1))
+        day_date_str = target_day.get("date")
+        day_status = target_day.get("status", "pending")
         
         # Check if day is already completed or missed
         if day_status in ["completed", "missed"]:
-            window_start = today_entry.get("window_start_ist")
-            window_end = today_entry.get("window_end_ist")
+            window_start = target_day.get("window_start_ist")
+            window_end = target_day.get("window_end_ist")
             
             return {
                 "allowed": False,
@@ -382,17 +446,17 @@ class Challenge:
                 "already_posted": day_status == "completed",
                 "window_start": window_start,
                 "window_end": window_end,
-                "timezone": "Asia/Kolkata",
+                "timezone": self.default_timezone,
                 "current_day": challenge.get("current_day", 1),
                 "daily_points": 100 + (day_number - 1) * 50
             }
         
         # Get window times
-        window_start_str = today_entry.get("window_start_ist")
-        window_end_str = today_entry.get("window_end_ist")
+        window_start_str = target_day.get("window_start_ist")
+        window_end_str = target_day.get("window_end_ist")
         
         if not window_start_str or not window_end_str:
-            # Fallback: calculate window based on daily time
+            # Calculate window based on daily time
             daily_time = challenge.get("daily_post_time", "19:00")
             window_minutes = challenge.get("time_window_minutes", 60)
             hour, minute = map(int, daily_time.split(':'))
@@ -405,10 +469,20 @@ class Challenge:
                 window_start_str = window_start.isoformat()
                 window_end_str = window_end.isoformat()
             except Exception:
-                window_start_str = None
-                window_end_str = None
+                return {
+                    "allowed": False,
+                    "reason": "invalid_window",
+                    "message": "Unable to determine posting window",
+                    "day_number": day_number,
+                    "already_posted": False,
+                    "window_start": None,
+                    "window_end": None,
+                    "timezone": self.default_timezone,
+                    "current_day": day_number,
+                    "daily_points": 100 + (day_number - 1) * 50
+                }
         
-        # Check if already posted today
+        # Check if already posted for this day
         user_oid = safe_objectid(user_id)
         challenge_oid = safe_objectid(challenge["_id"])
         
@@ -420,7 +494,7 @@ class Challenge:
                 "already_posted": False,
                 "window_start": window_start_str,
                 "window_end": window_end_str,
-                "timezone": "Asia/Kolkata",
+                "timezone": self.default_timezone,
                 "current_day": challenge.get("current_day", 1),
                 "daily_points": 100 + (day_number - 1) * 50
             }
@@ -441,91 +515,90 @@ class Challenge:
                 "already_posted": True,
                 "window_start": window_start_str,
                 "window_end": window_end_str,
-                "timezone": "Asia/Kolkata",
+                "timezone": self.default_timezone,
                 "current_day": day_number,
                 "daily_points": 100 + (day_number - 1) * 50
             }
         
         # Check if within window
-        if window_start_str and window_end_str:
-            try:
-                window_start = datetime.fromisoformat(window_start_str)
-                window_end = datetime.fromisoformat(window_end_str)
-                
-                if window_start.tzinfo is None:
-                    window_start = self.ist_tz.localize(window_start)
-                if window_end.tzinfo is None:
-                    window_end = self.ist_tz.localize(window_end)
-                
-                if window_start <= now_ist <= window_end:
-                    minutes_remaining = max(0, int((window_end - now_ist).total_seconds() / 60))
-                    return {
-                        "allowed": True,
-                        "reason": "within_window",
-                        "message": f"You can post now for day {day_number}! Window closes in {minutes_remaining} minutes.",
-                        "day_number": day_number,
-                        "already_posted": False,
-                        "window_start": window_start_str,
-                        "window_end": window_end_str,
-                        "timezone": "Asia/Kolkata",
-                        "current_day": day_number,
-                        "daily_points": 100 + (day_number - 1) * 50,
-                        "minutes_remaining": minutes_remaining
-                    }
-                elif now_ist < window_start:
-                    minutes_until = max(0, int((window_start - now_ist).total_seconds() / 60))
-                    return {
-                        "allowed": False,
-                        "reason": "before_window",
-                        "message": f"Posting window for day {day_number} opens in {minutes_until} minutes",
-                        "day_number": day_number,
-                        "already_posted": False,
-                        "window_start": window_start_str,
-                        "window_end": window_end_str,
-                        "timezone": "Asia/Kolkata",
-                        "current_day": day_number,
-                        "daily_points": 100 + (day_number - 1) * 50,
-                        "time_until_window_minutes": minutes_until
-                    }
-                else:
-                    # Window has passed - mark as missed
-                    if day_status == "pending":
-                        # Update calendar day to missed
-                        calendar_days = challenge.get("calendar_days", [])
-                        for i, day in enumerate(calendar_days):
-                            if day.get("day_number") == day_number:
-                                calendar_days[i]["status"] = "missed"
-                                calendar_days[i]["points_earned"] = 0
-                                break
-                        
-                        # Update challenge in database
-                        self.collection.update_one(
-                            {"_id": challenge_oid},
-                            {
-                                "$set": {
-                                    "calendar_days": calendar_days,
-                                    "updated_at": datetime.utcnow()
-                                }
-                            }
-                        )
+        try:
+            window_start = datetime.fromisoformat(window_start_str)
+            window_end = datetime.fromisoformat(window_end_str)
+            
+            if window_start.tzinfo is None:
+                window_start = self.ist_tz.localize(window_start)
+            if window_end.tzinfo is None:
+                window_end = self.ist_tz.localize(window_end)
+            
+            if window_start <= now_dt <= window_end:
+                minutes_remaining = max(0, int((window_end - now_dt).total_seconds() / 60))
+                return {
+                    "allowed": True,
+                    "reason": "within_window",
+                    "message": f"You can post now for day {day_number}! Window closes in {minutes_remaining} minutes.",
+                    "day_number": day_number,
+                    "already_posted": False,
+                    "window_start": window_start_str,
+                    "window_end": window_end_str,
+                    "timezone": self.default_timezone,
+                    "current_day": day_number,
+                    "daily_points": 100 + (day_number - 1) * 50,
+                    "minutes_remaining": minutes_remaining
+                }
+            elif now_dt < window_start:
+                minutes_until = max(0, int((window_start - now_dt).total_seconds() / 60))
+                return {
+                    "allowed": False,
+                    "reason": "before_window",
+                    "message": f"Posting window for day {day_number} opens in {minutes_until} minutes",
+                    "day_number": day_number,
+                    "already_posted": False,
+                    "window_start": window_start_str,
+                    "window_end": window_end_str,
+                    "timezone": self.default_timezone,
+                    "current_day": day_number,
+                    "daily_points": 100 + (day_number - 1) * 50,
+                    "time_until_window_minutes": minutes_until
+                }
+            else:
+                # Window has passed - mark as missed
+                if day_status == "pending":
+                    # Update calendar day to missed
+                    calendar_days = challenge.get("calendar_days", [])
+                    for i, day in enumerate(calendar_days):
+                        if day.get("day_number") == day_number:
+                            calendar_days[i]["status"] = "missed"
+                            calendar_days[i]["points_earned"] = 0
+                            break
                     
-                    return {
-                        "allowed": False,
-                        "reason": "after_window",
-                        "message": f"Posting window for day {day_number} has ended",
-                        "day_number": day_number,
-                        "already_posted": False,
-                        "window_start": window_start_str,
-                        "window_end": window_end_str,
-                        "timezone": "Asia/Kolkata",
-                        "current_day": day_number,
-                        "daily_points": 100 + (day_number - 1) * 50,
-                        "day_status": "missed"
-                    }
-            except Exception as e:
-                # If window parsing fails, return generic error
-                pass
-        
+                    # Update challenge in database
+                    self.collection.update_one(
+                        {"_id": challenge_oid},
+                        {
+                            "$set": {
+                                "calendar_days": calendar_days,
+                                "updated_at": datetime.utcnow()
+                            }
+                        }
+                    )
+                
+                return {
+                    "allowed": False,
+                    "reason": "after_window",
+                    "message": f"Posting window for day {day_number} has ended",
+                    "day_number": day_number,
+                    "already_posted": False,
+                    "window_start": window_start_str,
+                    "window_end": window_end_str,
+                    "timezone": self.default_timezone,
+                    "current_day": day_number,
+                    "daily_points": 100 + (day_number - 1) * 50,
+                    "day_status": "missed"
+                }
+        except Exception as e:
+            logger = logging.getLogger(__name__)
+            logger.error(f"Error checking window: {str(e)}")
+            
         # If we get here, there's an issue with window times
         return {
             "allowed": False,
@@ -535,7 +608,7 @@ class Challenge:
             "already_posted": False,
             "window_start": window_start_str,
             "window_end": window_end_str,
-            "timezone": "Asia/Kolkata",
+            "timezone": self.default_timezone,
             "current_day": day_number,
             "daily_points": 100 + (day_number - 1) * 50
         }
@@ -543,6 +616,9 @@ class Challenge:
     def update_challenge_day(self, challenge_id: str, day_number: int, 
                          post_id: str, points: int = 100) -> Dict[str, Any]:
         """Update a challenge day as completed and return updated challenge."""
+        if not self.collection:
+            return {"success": False, "error": "Database not available"}
+            
         oid = safe_objectid(challenge_id)
         if not oid:
             return {"success": False, "error": "Invalid challenge ID"}
@@ -581,7 +657,7 @@ class Challenge:
             new_current_day = challenge.get("duration", day_number + 1)
         
         # Update challenge
-        self.collection.update_one(
+        update_result = self.collection.update_one(
             {"_id": oid},
             {
                 "$set": {
@@ -593,14 +669,18 @@ class Challenge:
             }
         )
         
-        # Update user points
-        self.db.users.update_one(
-            {"_id": user_oid},
-            {"$inc": {"total_points": points}}
-        )
+        # Update user points if user collection exists
+        if user_oid and self.db and hasattr(self.db, 'users'):
+            self.db.users.update_one(
+                {"_id": user_oid},
+                {"$inc": {"total_points": points}}
+            )
         
         # Get updated challenge
         updated_challenge = self.collection.find_one({"_id": oid})
+        
+        if not updated_challenge:
+            return {"success": False, "error": "Failed to update challenge"}
         
         return {
             "success": True,
@@ -610,6 +690,9 @@ class Challenge:
         }
     
     def get_challenge_calendar(self, challenge_id: str) -> Optional[List[Dict[str, Any]]]:
+        if not self.collection:
+            return None
+            
         oid = safe_objectid(challenge_id)
         if not oid:
             return None
@@ -625,6 +708,9 @@ class Challenge:
         return convert_object_ids(challenge.get("calendar_days", []))
     
     def complete_challenge(self, challenge_id: str) -> bool:
+        if not self.collection:
+            return False
+            
         oid = safe_objectid(challenge_id)
         if not oid:
             return False
@@ -643,6 +729,9 @@ class Challenge:
         return result.modified_count > 0
     
     def cancel_challenge(self, challenge_id: str) -> bool:
+        if not self.collection:
+            return False
+            
         oid = safe_objectid(challenge_id)
         if not oid:
             return False
@@ -664,14 +753,27 @@ class Challenge:
 class Post:
     def __init__(self, db):
         self.db = db
-        self.collection = db.posts
+        self.collection = db.posts if db else None
 
     def create_post(self, user_id, challenge_id, day_number, description='', image_url=None, image_type=None):
+        if not self.collection or not self.db:
+            return {"error": "Database not available"}
+            
         user_oid = safe_objectid(user_id)
         challenge_oid = safe_objectid(challenge_id)
         
         if not user_oid or not challenge_oid:
             return {"error": "Invalid user or challenge ID"}
+        
+        # Check if post already exists for this day
+        existing_post = self.collection.find_one({
+            "user_id": user_oid,
+            "challenge_id": challenge_oid,
+            "day_number": int(day_number)
+        })
+        
+        if existing_post:
+            return {"error": "You have already posted for this day"}
         
         # Calculate points for this day
         points_earned = 100 + (day_number - 1) * 50
@@ -697,9 +799,9 @@ class Post:
         post_id = result.inserted_id
         
         # Update challenge day
-        challenge_handler = Challenge(self.db)
+        challenge_handler = Challenge(self.db, default_timezone="Asia/Kolkata")
         update_result = challenge_handler.update_challenge_day(
-            challenge_id, day_number, str(post_id), points_earned
+            str(challenge_id), day_number, str(post_id), points_earned
         )
         
         if not update_result.get("success"):
@@ -708,8 +810,8 @@ class Post:
             return {"error": "Failed to update challenge"}
         
         # Get user and challenge info for response
-        user = self.db.users.find_one({"_id": user_oid})
-        challenge = self.db.challenges.find_one({"_id": challenge_oid})
+        user = self.db.users.find_one({"_id": user_oid}) if self.db.users else None
+        challenge = self.db.challenges.find_one({"_id": challenge_oid}) if self.db.challenges else None
         
         post_data["_id"] = post_id
         post_data["user_name"] = user.get("name") if user else "Anonymous"
@@ -724,6 +826,9 @@ class Post:
         return response_data
     
     def boost_post(self, post_id, user_id):
+        if not self.collection:
+            return None
+            
         oid = safe_objectid(post_id)
         user_oid = safe_objectid(user_id)
         
@@ -765,6 +870,9 @@ class Post:
         }
     
     def add_comment(self, post_id, user_id, text):
+        if not self.collection:
+            return None
+            
         oid = safe_objectid(post_id)
         user_oid = safe_objectid(user_id)
         
@@ -803,6 +911,9 @@ class Post:
         }
     
     def delete_post_by_user(self, post_id, user_id):
+        if not self.collection:
+            return {"error": "Database not available"}, 503
+            
         oid = safe_objectid(post_id)
         user_oid = safe_objectid(user_id)
         
@@ -832,42 +943,55 @@ class Post:
 
 class Follow:
     def __init__(self, db):
-        self.collection = db.users
+        self.collection = db.users if db else None
 
     def follow_user(self, follower_id, following_id):
+        if not self.collection:
+            return False
+            
         follower_oid = safe_objectid(follower_id)
         following_oid = safe_objectid(following_id)
         
         if not follower_oid or not following_oid:
             return False
         
-        self.collection.update_one(
+        if follower_oid == following_oid:
+            return False
+        
+        # Update follower's following list
+        result1 = self.collection.update_one(
             {"_id": follower_oid},
             {"$addToSet": {"following": following_oid}}
         )
         
-        self.collection.update_one(
+        # Update following user's followers list
+        result2 = self.collection.update_one(
             {"_id": following_oid},
             {"$addToSet": {"followers": follower_oid}}
         )
         
-        return True
+        return result1.modified_count > 0 or result2.modified_count > 0
     
     def unfollow_user(self, follower_id, following_id):
+        if not self.collection:
+            return False
+            
         follower_oid = safe_objectid(follower_id)
         following_oid = safe_objectid(following_id)
         
         if not follower_oid or not following_oid:
             return False
         
-        self.collection.update_one(
+        # Update follower's following list
+        result1 = self.collection.update_one(
             {"_id": follower_oid},
             {"$pull": {"following": following_oid}}
         )
         
-        self.collection.update_one(
+        # Update following user's followers list
+        result2 = self.collection.update_one(
             {"_id": following_oid},
             {"$pull": {"followers": follower_oid}}
         )
         
-        return True
+        return result1.modified_count > 0 or result2.modified_count > 0
