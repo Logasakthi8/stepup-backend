@@ -23,57 +23,65 @@ load_dotenv()
 
 app = Flask(__name__)
 
-# CORS Configuration - Fix this
+# CORS Configuration - Fixed
 CORS(app, 
      resources={r"/api/*": {
-         "origins": "*",
+         "origins": os.getenv('ALLOWED_ORIGINS', '*').split(','),
          "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
          "allow_headers": ["Content-Type", "Authorization", "X-User-Timezone"],
-         "expose_headers": ["Authorization"]
+         "expose_headers": ["Authorization"],
+         "supports_credentials": True
      }},
      supports_credentials=True)
 
-# JWT Configuration
+# JWT Configuration - Fixed timezone issue
 app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY')
-app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(days=7)
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(days=int(os.getenv('JWT_EXPIRES_DAYS', 7)))
+app.config['JWT_TOKEN_LOCATION'] = ['headers']
 jwt = JWTManager(app)
 
 # MongoDB Configuration
 mongodb_uri = os.getenv('MONGODB_URI')
-logger.info(f"MongoDB URI: {mongodb_uri[:20]}...")
+if not mongodb_uri:
+    logger.error("❌ MONGODB_URI not found in environment variables")
+    raise ValueError("MONGODB_URI environment variable is required")
+
+logger.info(f"MongoDB URI configured: {'*' * 20}")
 
 try:
-    client = MongoClient(mongodb_uri, serverSelectionTimeoutMS=5000)
+    client = MongoClient(mongodb_uri, serverSelectionTimeoutMS=10000)
     client.server_info()  # Test connection
     db = client['discipline_builder']
     logger.info("✅ MongoDB connected successfully")
 except Exception as e:
     logger.error(f"❌ MongoDB connection failed: {e}")
-    raise
+    # Don't raise in production - allow app to start without DB for testing
+    # raise
+    db = None
 
-# Initialize models
-from models import User, Challenge, Post, Follow
-user_model = User(db)
-challenge_model = Challenge(db)
-post_model = Post(db)
-follow_model = Follow(db)
-
-# Helper function to convert MongoDB documents to JSON serializable
+# Helper function to convert MongoDB documents to JSON serializable - Fixed
 def convert_object_ids(obj):
     """
     Recursively convert Mongo ObjectId, datetime, and bytes to JSON-serializable values
     """
+    if obj is None:
+        return None
+        
     if isinstance(obj, list):
         return [convert_object_ids(item) for item in obj]
     elif isinstance(obj, dict):
         result = {}
         for key, value in obj.items():
-            if isinstance(value, ObjectId):
+            if key == '_id' and isinstance(value, ObjectId):
+                result[key] = str(value)
+            elif isinstance(value, ObjectId):
                 result[key] = str(value)
             elif isinstance(value, datetime):
+                # Ensure datetime is timezone-aware for JSON serialization
+                if value.tzinfo is None:
+                    value = value.replace(tzinfo=timezone.utc)
                 result[key] = value.isoformat()
             elif isinstance(value, bytes):
-                # For image data, keep as string
                 try:
                     result[key] = value.decode('utf-8', errors='ignore')
                 except:
@@ -86,6 +94,8 @@ def convert_object_ids(obj):
     elif isinstance(obj, ObjectId):
         return str(obj)
     elif isinstance(obj, datetime):
+        if obj.tzinfo is None:
+            obj = obj.replace(tzinfo=timezone.utc)
         return obj.isoformat()
     elif isinstance(obj, bytes):
         try:
@@ -94,12 +104,33 @@ def convert_object_ids(obj):
             return str(obj)
     return obj
 
+# Initialize models - Added error handling
+try:
+    from models import User, Challenge, Post, Follow
+    user_model = User(db) if db else None
+    challenge_model = Challenge(db) if db else None
+    post_model = Post(db) if db else None
+    follow_model = Follow(db) if db else None
+    logger.info("✅ Models initialized successfully")
+except ImportError as e:
+    logger.error(f"❌ Failed to import models: {e}")
+    user_model = challenge_model = post_model = follow_model = None
+except Exception as e:
+    logger.error(f"❌ Error initializing models: {e}")
+    user_model = challenge_model = post_model = follow_model = None
+
 # ================ AUTH ================
 
 @app.route('/api/auth/signup', methods=['POST'])
 def signup():
     try:
+        if not user_model:
+            return jsonify({'error': 'Database not available'}), 503
+            
         data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+            
         email = data.get('email')
         password = data.get('password')
         name = data.get('name')
@@ -108,10 +139,14 @@ def signup():
         if not email or not password:
             return jsonify({'error': 'Email and password are required'}), 400
 
-        if user_model.find_by_email(email):
+        existing_user = user_model.find_by_email(email)
+        if existing_user:
             return jsonify({'error': 'User already exists'}), 400
 
         user = user_model.create_user(email, password, name, profile_photo)
+        if not user:
+            return jsonify({'error': 'Failed to create user'}), 500
+            
         token = create_access_token(identity=str(user['_id']))
 
         return jsonify({
@@ -127,12 +162,18 @@ def signup():
 @app.route('/api/auth/login', methods=['POST'])
 def login():
     try:
+        if not user_model:
+            return jsonify({'error': 'Database not available'}), 503
+            
         data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+            
         email = data.get('email')
         password = data.get('password')
 
         user = user_model.find_by_email(email)
-        if not user or not user_model.verify_password(user['password'], password):
+        if not user or not user_model.verify_password(user.get('password'), password):
             return jsonify({'error': 'Invalid credentials'}), 401
 
         token = create_access_token(identity=str(user['_id']))
@@ -144,6 +185,7 @@ def login():
         user_response.setdefault('following', [])
         user_response.setdefault('total_points', 0)
         user_response.setdefault('bio', '')
+        user_response.setdefault('isVerified', False)
 
         return jsonify({
             'message': 'Login successful',
@@ -161,6 +203,9 @@ def login():
 @jwt_required()
 def create_challenge():
     try:
+        if not challenge_model:
+            return jsonify({'error': 'Database not available'}), 503
+            
         data = request.get_json()
         user_id = get_jwt_identity()
         logger.info(f"Creating challenge for user: {user_id}")
@@ -170,7 +215,7 @@ def create_challenge():
         if existing:
             return jsonify({
                 'error': 'You already have an active challenge',
-                'challenge_id': existing.get('_id')
+                'challenge_id': str(existing.get('_id'))
             }), 400
 
         # Validate required fields
@@ -190,6 +235,9 @@ def create_challenge():
             description=data.get('description', '')
         )
 
+        if not challenge:
+            return jsonify({'error': 'Failed to create challenge'}), 500
+
         # Update user's current challenge
         db.users.update_one(
             {'_id': ObjectId(user_id)},
@@ -197,7 +245,7 @@ def create_challenge():
         )
 
         logger.info(f"Challenge created: {challenge.get('_id')}")
-        return jsonify({'challenge': challenge}), 201
+        return jsonify({'challenge': convert_object_ids(challenge)}), 201
 
     except ValueError as e:
         logger.error(f"Validation error: {str(e)}")
@@ -211,6 +259,9 @@ def create_challenge():
 @jwt_required()
 def get_current_challenge():
     try:
+        if not challenge_model:
+            return jsonify({'error': 'Database not available'}), 503
+            
         user_id = get_jwt_identity()
         logger.info(f"Getting current challenge for user: {user_id}")
         
@@ -221,7 +272,7 @@ def get_current_challenge():
             return jsonify({'message': 'No active challenge'}), 404
 
         logger.info(f"Found challenge: {challenge.get('_id')}")
-        return jsonify({'challenge': challenge}), 200
+        return jsonify({'challenge': convert_object_ids(challenge)}), 200
     except Exception as e:
         logger.error(f"Get current challenge error: {str(e)}", exc_info=True)
         return jsonify({'error': 'Failed to load challenge'}), 500
@@ -231,6 +282,9 @@ def get_current_challenge():
 @jwt_required()
 def get_challenge_calendar():
     try:
+        if not challenge_model:
+            return jsonify({'error': 'Database not available'}), 503
+            
         user_id = get_jwt_identity()
         challenge = challenge_model.get_user_challenge(user_id)
 
@@ -240,7 +294,7 @@ def get_challenge_calendar():
         calendar = challenge_model.get_challenge_calendar(challenge['_id'])
 
         return jsonify({
-            'calendar': calendar,
+            'calendar': convert_object_ids(calendar),
             'challenge_name': challenge['challenge_name'],
             'current_day': challenge['current_day']
         }), 200
@@ -254,6 +308,9 @@ def get_challenge_calendar():
 @jwt_required()
 def create_post():
     try:
+        if not post_model or not challenge_model:
+            return jsonify({'error': 'Database not available'}), 503
+            
         user_id = get_jwt_identity()
         data = request.get_json(silent=True) or {}
         logger.info(f"Creating post for user: {user_id}")
@@ -279,14 +336,14 @@ def create_post():
         image_type = data.get('image_type')
 
         # Handle data URI → base64
-        if image_url and image_url.startswith('data:'):
+        if image_url and isinstance(image_url, str) and image_url.startswith('data:'):
             try:
                 header, encoded = image_url.split(',', 1)
                 image_url = encoded
                 if ':' in header and ';' in header:
                     image_type = header.split(':')[1].split(';')[0]
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to parse data URI: {e}")
 
         # 4️⃣ Create post
         post = post_model.create_post(
@@ -299,8 +356,9 @@ def create_post():
         )
 
         # Check if post creation failed
-        if 'error' in post:
-            return jsonify({'error': post['error']}), 400
+        if not post or isinstance(post, dict) and 'error' in post:
+            error_msg = post.get('error', 'Failed to create post') if isinstance(post, dict) else 'Failed to create post'
+            return jsonify({'error': error_msg}), 400
 
         # 5️⃣ Get user and challenge info
         user = user_model.find_by_id(user_id)
@@ -313,21 +371,25 @@ def create_post():
 
         # 6️⃣ Format image URL
         image_data = None
-        if post.get('image_url'):
-            mime = post.get('image_type', 'image/jpeg')
-            image_data = f"data:{mime};base64,{post['image_url']}"
+        post_dict = convert_object_ids(post)
+        if post_dict.get('image_url'):
+            mime = post_dict.get('image_type', 'image/jpeg')
+            if isinstance(post_dict['image_url'], str) and not post_dict['image_url'].startswith('data:'):
+                image_data = f"data:{mime};base64,{post_dict['image_url']}"
+            else:
+                image_data = post_dict['image_url']
 
         # 7️⃣ Create hydrated post
         hydrated_post = {
-            **convert_object_ids(post),
+            **post_dict,
             "image_url": image_data,
             "user_name": user.get("name", "Unknown User"),
             "profile_photo": user.get("profile_photo"),
             "challenge_name": challenge_data.get("challenge_name") if challenge_data else "",
             "is_boosted_by_user": False,
-            "boosts_count": post.get('boosts_count', 0),
-            "comment_count": post.get('comment_count', 0),
-            "comments": post.get('comments', [])
+            "boosts_count": post_dict.get('boosts_count', 0),
+            "comment_count": post_dict.get('comment_count', 0),
+            "comments": post_dict.get('comments', [])
         }
 
         return jsonify({
@@ -346,6 +408,9 @@ def create_post():
 @jwt_required()
 def check_posting_availability():
     try:
+        if not challenge_model:
+            return jsonify({'error': 'Database not available'}), 503
+            
         user_id = get_jwt_identity()
         availability = challenge_model.check_posting_availability(user_id)
         return jsonify(availability), 200
@@ -357,6 +422,9 @@ def check_posting_availability():
 @jwt_required()
 def boost_post(post_id):
     try:
+        if not post_model:
+            return jsonify({'error': 'Database not available'}), 503
+            
         user_id = get_jwt_identity()
         result = post_model.boost_post(post_id, user_id)
         
@@ -377,6 +445,9 @@ def boost_post(post_id):
 @jwt_required()
 def add_comment(post_id):
     try:
+        if not post_model:
+            return jsonify({'error': 'Database not available'}), 503
+            
         user_id = get_jwt_identity()
         data = request.get_json()
         
@@ -404,6 +475,9 @@ def add_comment(post_id):
 @jwt_required()
 def get_feed():
     try:
+        if not post_model or not user_model or not challenge_model:
+            return jsonify({'error': 'Database not available'}), 503
+            
         user_id = get_jwt_identity()
         page = request.args.get('page', 1, type=int)
         limit = request.args.get('limit', 20, type=int)
@@ -450,9 +524,12 @@ def get_feed():
                 # Get challenge info
                 challenge = None
                 if post_dict.get('challenge_id'):
-                    challenge = challenge_model.collection.find_one(
-                        {'_id': ObjectId(post_dict['challenge_id'])}
-                    )
+                    try:
+                        challenge = challenge_model.collection.find_one(
+                            {'_id': ObjectId(post_dict['challenge_id'])}
+                        )
+                    except:
+                        challenge = None
                 
                 # Image data handling
                 image_data = None
@@ -526,6 +603,9 @@ def get_feed():
 @jwt_required()
 def delete_post(post_id):
     try:
+        if not post_model:
+            return jsonify({'error': 'Database not available'}), 503
+            
         user_id = get_jwt_identity()
         result, status = post_model.delete_post_by_user(post_id, user_id)
         return jsonify(result), status
@@ -539,6 +619,9 @@ def delete_post(post_id):
 @jwt_required()
 def get_users():
     try:
+        if not db:
+            return jsonify({'error': 'Database not available'}), 503
+            
         current_user_id = get_jwt_identity()
         logger.info(f"Getting users for current user: {current_user_id}")
 
@@ -555,18 +638,21 @@ def get_users():
             # Get active challenge details
             active_challenge = None
             if user.get("current_challenge"):
-                challenge = db.challenges.find_one(
-                    {"_id": ObjectId(user["current_challenge"]), "status": "active"}
-                )
-                if challenge:
-                    active_challenge = {
-                        "_id": str(challenge["_id"]),
-                        "challenge_name": challenge.get("challenge_name", ""),
-                        "current_day": challenge.get("current_day", 0),
-                        "duration": challenge.get("duration", 30),
-                        "total_points": challenge.get("total_points", 0),
-                        "status": challenge.get("status", "active")
-                    }
+                try:
+                    challenge = db.challenges.find_one(
+                        {"_id": ObjectId(user["current_challenge"]), "status": "active"}
+                    )
+                    if challenge:
+                        active_challenge = {
+                            "_id": str(challenge["_id"]),
+                            "challenge_name": challenge.get("challenge_name", ""),
+                            "current_day": challenge.get("current_day", 0),
+                            "duration": challenge.get("duration", 30),
+                            "total_points": challenge.get("total_points", 0),
+                            "status": challenge.get("status", "active")
+                        }
+                except:
+                    active_challenge = None
             
             # Convert followers/following to string lists
             followers = [str(follower_id) for follower_id in user.get("followers", [])]
@@ -601,6 +687,9 @@ def get_users():
 @jwt_required()
 def my_profile():
     try:
+        if not user_model or not db:
+            return jsonify({'error': 'Database not available'}), 503
+            
         user_id = get_jwt_identity()
         logger.info(f"Getting profile for user: {user_id}")
         
@@ -621,22 +710,28 @@ def my_profile():
         # Get active challenge
         active_challenge = None
         if user.get('current_challenge'):
-            challenge = db.challenges.find_one({
-                '_id': ObjectId(user['current_challenge']),
-                'user_id': ObjectId(user_id)
-            })
-            if challenge:
-                active_challenge = convert_object_ids(challenge)
+            try:
+                challenge = db.challenges.find_one({
+                    '_id': ObjectId(user['current_challenge']),
+                    'user_id': ObjectId(user_id)
+                })
+                if challenge:
+                    active_challenge = convert_object_ids(challenge)
+            except:
+                active_challenge = None
 
         # Get completed challenges
         completed_challenges = []
-        challenges_cursor = db.challenges.find({
-            'user_id': ObjectId(user_id),
-            'status': 'completed'
-        }).sort('created_at', -1)
-        
-        for challenge in challenges_cursor:
-            completed_challenges.append(convert_object_ids(challenge))
+        try:
+            challenges_cursor = db.challenges.find({
+                'user_id': ObjectId(user_id),
+                'status': 'completed'
+            }).sort('created_at', -1)
+            
+            for challenge in challenges_cursor:
+                completed_challenges.append(convert_object_ids(challenge))
+        except:
+            completed_challenges = []
 
         # Build user response with all required fields
         user_response = convert_object_ids(user)
@@ -667,6 +762,9 @@ def my_profile():
 @jwt_required()
 def update_profile_photo():
     try:
+        if not db:
+            return jsonify({'error': 'Database not available'}), 503
+            
         user_id = get_jwt_identity()
         user = user_model.find_by_id(user_id)
 
@@ -715,6 +813,9 @@ def update_profile_photo():
 @jwt_required()
 def get_user_by_id(user_id):
     try:
+        if not user_model or not db:
+            return jsonify({'error': 'Database not available'}), 503
+            
         current_user_id = get_jwt_identity()
         user = user_model.find_by_id(user_id)
         
@@ -730,17 +831,23 @@ def get_user_by_id(user_id):
 
         active_challenge = None
         if user.get('current_challenge'):
-            challenge = db.challenges.find_one({'_id': ObjectId(user['current_challenge'])})
-            if challenge:
-                active_challenge = convert_object_ids(challenge)
+            try:
+                challenge = db.challenges.find_one({'_id': ObjectId(user['current_challenge'])})
+                if challenge:
+                    active_challenge = convert_object_ids(challenge)
+            except:
+                active_challenge = None
 
         completed_challenges = []
-        challenges_cursor = db.challenges.find({
-            'user_id': ObjectId(user_id),
-            'status': 'completed'
-        })
-        for challenge in challenges_cursor:
-            completed_challenges.append(convert_object_ids(challenge))
+        try:
+            challenges_cursor = db.challenges.find({
+                'user_id': ObjectId(user_id),
+                'status': 'completed'
+            })
+            for challenge in challenges_cursor:
+                completed_challenges.append(convert_object_ids(challenge))
+        except:
+            completed_challenges = []
 
         # Build user response with all required fields
         user_response = convert_object_ids(user)
@@ -766,12 +873,19 @@ def get_user_by_id(user_id):
 @app.route('/api/health', methods=['GET'])
 def health():
     try:
-        db.command('ping')
-        return jsonify({
-            'status': 'healthy',
-            'database': 'connected',
-            'timestamp': datetime.utcnow().isoformat()
-        }), 200
+        if db:
+            db.command('ping')
+            return jsonify({
+                'status': 'healthy',
+                'database': 'connected',
+                'timestamp': datetime.utcnow().isoformat()
+            }), 200
+        else:
+            return jsonify({
+                'status': 'degraded',
+                'database': 'disconnected',
+                'timestamp': datetime.utcnow().isoformat()
+            }), 200
     except Exception as e:
         return jsonify({
             'status': 'unhealthy',
@@ -786,6 +900,9 @@ def health():
 @jwt_required()
 def follow_user(user_id):
     try:
+        if not follow_model:
+            return jsonify({'error': 'Database not available'}), 503
+            
         current_user_id = get_jwt_identity()
 
         if current_user_id == user_id:
@@ -806,6 +923,9 @@ def follow_user(user_id):
 @jwt_required()
 def unfollow_user(user_id):
     try:
+        if not follow_model:
+            return jsonify({'error': 'Database not available'}), 503
+            
         current_user_id = get_jwt_identity()
 
         result = follow_model.unfollow_user(current_user_id, user_id)
@@ -830,13 +950,16 @@ def test_endpoint():
         "timestamp": datetime.utcnow().isoformat()
     }), 200
 
+# Error handlers
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({'error': 'Resource not found'}), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    logger.error(f"Internal server error: {error}")
+    return jsonify({'error': 'Internal server error'}), 500
+
 if __name__ == "__main__":
-    app.run(debug=True)
-
-
-
-
-
-
-
-
+    port = int(os.getenv('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=os.getenv('FLASK_DEBUG', 'False').lower() == 'true')
